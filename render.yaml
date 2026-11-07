@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: duely
+    runtime: node
+    plan: free
+    buildCommand: npm ci && npm run build
+    startCommand: npm start
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: PAYPAL_CLIENT_ID
+        sync: false
+      - key: PAYPAL_CLIENT_SECRET
+        sync: false
+      - key: PAYPAL_ENV
+        value: sandbox
+      - key: PAYPAL_WEBHOOK_ID
+        sync: false
+      - key: INVOICER_NAME
+        value: Alex Rivera
+      - key: INVOICER_BUSINESS
+        value: Rivera Design Studio
+      - key: DEFAULT_CURRENCY
+        value: USD
