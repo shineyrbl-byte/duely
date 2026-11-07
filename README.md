@@ -1,36 +1,86 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Duely — get paid on time
 
-## Getting Started
+**An AI copilot for freelancers that turns messy client chats into PayPal invoices, then chases late payments for you — with your approval on every message.**
 
-First, run the development server:
+Built for the PayPal AI Hackathon (Nov 2026).
 
+## The problem
+
+Freelancers lose hours every month on admin: turning a WhatsApp thread or a voice memo into an invoice, remembering who has paid, and writing awkward "just following up…" emails. Late payment is common, and the chasing is the part people hate most.
+
+## What Duely does
+
+1. **Invoice from anything.** Paste a client chat, dictate a voice note, or drop in a screenshot or PDF contract. Claude reads it and drafts a structured invoice: client, line items, hours vs. flat fees, tax, discount, due date and a friendly note. It remembers your clients, so "same rate as last time" works, and it flags anything missing (like an email) before you send.
+2. **One-click send through PayPal.** After you review the draft, Duely creates and sends a real invoice with the **PayPal Invoicing v2 API**. Your client gets PayPal's hosted payment page (PayPal, card, Venmo and Pay Later where available).
+3. **A collections agent that asks first.** The agent reviews every open PayPal invoice and looks up each client's payment history. For each invoice, it either drafts a reminder or skips it and says why. Tone escalates sensibly (heads-up → gentle → firm → final), it never nags within 3 days of a previous reminder, and it is extra warm with good clients. **Nothing is sent until you approve it.** Approved reminders go out through PayPal's `/remind` endpoint.
+4. **A live receivables dashboard.** An AG Grid table shows status, outstanding amount, days late and reminder count, with filters and search. A summary row shows outstanding, overdue, due-this-week and collected totals. PayPal webhooks (`INVOICING.INVOICE.PAID`) show up in the activity feed as soon as a client pays.
+
+## Try it
+
+### Option A: demo mode (no keys at all)
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+npm install
+cp .env.example .env.local     # leave PayPal keys blank
+npm run build && npm start     # http://localhost:3000
+```
+Click **Load demo invoices**, then move the **Demo clock** forward to see invoices become overdue. Without PayPal keys, Duely uses an in-memory mock of the Invoicing API with the same response shapes. Add `ANTHROPIC_API_KEY` to turn on the AI features.
+
+### Option B: real PayPal sandbox
+1. Create a sandbox app at [developer.paypal.com](https://developer.paypal.com/dashboard/applications/sandbox) and copy its **Client ID** and **Secret**.
+2. Fill in `.env.local`:
+   ```
+   ANTHROPIC_API_KEY=sk-ant-...
+   PAYPAL_CLIENT_ID=...
+   PAYPAL_CLIENT_SECRET=...
+   PAYPAL_ENV=sandbox
+   INVOICER_NAME=Your Name
+   ```
+3. `npm run build && npm start`, then open http://localhost:3000. The badge should read **Connected · PayPal sandbox**.
+4. Send an invoice, click **Pay link ↗**, and pay it with a sandbox *personal* account. The dashboard updates on its next poll.
+5. Optional: deploy (see below), subscribe a webhook to `INVOICING.INVOICE.*` at `https://<your-app>/api/webhooks/paypal`, and set `PAYPAL_WEBHOOK_ID`.
+
+### Deploy on Render
+The repo includes `render.yaml`. Create a new **Blueprint** on Render, point it at this repo, and fill in the environment variables.
+
+## How it's built
+
+| Layer | Tech |
+|---|---|
+| App | Next.js 16 (App Router, route handlers), React 19, TypeScript, Tailwind CSS 4 |
+| Payments | PayPal REST: OAuth2 client credentials, **Invoicing v2** (`generate-next-invoice-number`, create, send, remind, record payment, cancel, list), **Webhooks** (signature verification) |
+| AI | **Claude Opus 5.5** through the official Anthropic TypeScript SDK |
+| Grid | **AG Grid** Community (Quartz theme, custom cell renderers, quick filter) |
+| Hosting | **Render** (`render.yaml`) |
+
+```
+src/
+  lib/paypal.ts        PayPal client (sandbox + mock), invoice normalisation
+  lib/ai.ts            Claude: invoice drafting + collections agent
+  lib/store.ts         proposals, reminder history, activity feed, demo clock
+  app/api/...          route handlers (state, invoices, ai/draft, agent, webhooks, demo)
+  components/...       Composer, InvoiceGrid (AG Grid), AgentPanel, Dashboard
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+## AI tools used, and how
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+- **Claude Opus 5.5 (Anthropic API): structured extraction.** `client.beta.messages.parse` with a Zod schema (structured outputs) turns free text, images (screenshots of chats) and PDFs (contracts, timesheets) into a typed invoice draft. Claude also gets your known clients and their past line items, so it can fill in emails and rates.
+- **Claude Opus 5.5: agentic tool use.** The collections agent runs on the SDK's tool runner with four tools: `list_receivables`, `get_client_history`, `propose_reminder` and `skip_invoice`. It reasons over live PayPal data and writes a personalised reminder for each invoice that needs one. It can only *propose*: sending goes through a human approval endpoint that calls PayPal.
+- Both use adaptive thinking, and server-side refusal fallbacks keep requests from failing outright.
+- **Browser Web Speech API** handles voice dictation in the composer.
+- **Claude Code** helped scaffold and write the project.
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+## Safety and design choices
 
-## Learn More
+- **Human in the loop:** the agent never contacts clients directly. Every reminder can be edited before it is approved.
+- **No invented charges:** the drafting prompt only bills for work stated in the input, and anything uncertain appears under "Check before sending".
+- **Verified webhooks:** events are checked with PayPal's `verify-webhook-signature` before Duely trusts them.
+- **Secrets stay server-side:** PayPal and Anthropic calls happen only in route handlers.
 
-To learn more about Next.js, take a look at the following resources:
+## Limitations
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+- Agent proposals, reminder history and the activity feed live in server memory, so they reset on restart. PayPal stays the source of truth for invoices.
+- The demo clock shifts "today" only inside Duely, so overdue flows can be shown without waiting weeks.
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+## License
 
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+[MIT](LICENSE)
