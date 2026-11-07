@@ -27,7 +27,7 @@ function claude() {
 
 // ---------- 1. Invoice drafting ----------
 
-const DraftSchema = z.object({
+export const DraftSchema = z.object({
   client_name: z.string().describe("Person to bill. Use the business name if no person is named."),
   client_email: z.string().nullable().describe("Client email if stated or known from history, else null."),
   client_business: z.string().nullable(),
