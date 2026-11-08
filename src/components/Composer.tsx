@@ -2,6 +2,7 @@
 
 import { useRef, useState } from "react";
 import type { DraftItem, InvoiceDraft } from "@/lib/types";
+import { PAYPAL_CURRENCIES, isPayPalCurrency } from "@/lib/currencies";
 import { api, fmtMoney, postJson } from "./api";
 
 const EXAMPLE = `hey! so for the Brightleaf project — Marcus said the new menu boards look amazing 🙌
@@ -158,6 +159,12 @@ export default function Composer({ aiEnabled, onSent }: { aiEnabled: boolean; on
           <div className="rounded-xl bg-brand-soft px-4 py-3 text-sm text-indigo-900">
             <span className="font-medium">How the AI read it:</span> {draft.reasoning_summary}
           </div>
+          {!isPayPalCurrency(draft.currency) && (
+            <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+              <span className="font-medium">PayPal can&apos;t invoice in {draft.currency}.</span> Choose a supported currency below
+              (for example USD) and adjust the prices to match.
+            </div>
+          )}
           {draft.missing_info.length > 0 && (
             <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
               <div className="font-medium">Check before sending</div>
@@ -246,7 +253,18 @@ export default function Composer({ aiEnabled, onSent }: { aiEnabled: boolean; on
             </div>
             <div>
               <label className="label">Currency</label>
-              <input className="input" value={draft.currency} onChange={(e) => update({ currency: e.target.value.toUpperCase().slice(0, 3) })} />
+              <select
+                className={`input ${!isPayPalCurrency(draft.currency) ? "!border-amber-400" : ""}`}
+                value={draft.currency}
+                onChange={(e) => update({ currency: e.target.value })}
+              >
+                {!isPayPalCurrency(draft.currency) && <option value={draft.currency}>{draft.currency} (not supported)</option>}
+                {PAYPAL_CURRENCIES.map((c) => (
+                  <option key={c} value={c}>
+                    {c}
+                  </option>
+                ))}
+              </select>
             </div>
             <div>
               <label className="label">Tax %</label>
@@ -272,7 +290,7 @@ export default function Composer({ aiEnabled, onSent }: { aiEnabled: boolean; on
               <button className="btn btn-ghost" onClick={() => setDraft(null)} disabled={busy !== null}>
                 Back
               </button>
-              <button className="btn btn-primary" onClick={send} disabled={busy !== null || !draft.client_email}>
+              <button className="btn btn-primary" onClick={send} disabled={busy !== null || !draft.client_email || !isPayPalCurrency(draft.currency)}>
                 {busy === "send" ? "Sending…" : "Send via PayPal →"}
               </button>
             </div>

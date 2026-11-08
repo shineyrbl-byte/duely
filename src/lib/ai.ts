@@ -11,6 +11,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import { betaZodOutputFormat, betaZodTool } from "@anthropic-ai/sdk/helpers/beta/zod";
 import { ApiError, GoogleGenAI, type Content, type GenerateContentParameters, type Part } from "@google/genai";
 import { z } from "zod";
+import { PAYPAL_CURRENCIES } from "./currencies";
 import { listRows } from "./paypal";
 import { isoDate, logActivity, newId, store, today } from "./store";
 import type { InvoiceDraft, InvoiceRow, ReminderProposal } from "./types";
@@ -60,7 +61,7 @@ const google = () => (gemini ??= new GoogleGenAI({ apiKey: process.env.GEMINI_AP
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const isTransient = (err: unknown) =>
-  (err instanceof ApiError && [404, 429, 500, 503].includes(err.status)) ||
+  (err instanceof ApiError && [404, 429, 500, 502, 503, 504].includes(err.status)) ||
   (err instanceof Error && /abort|timeout|timed out|fetch failed/i.test(err.message));
 
 /**
@@ -79,7 +80,7 @@ async function geminiGenerate(params: Omit<GenerateContentParameters, "model">, 
         if (!isTransient(err)) throw err;
         lastErr = err;
         // Only quick failures (busy / rate limited) are worth retrying on the same model.
-        const quick = err instanceof ApiError && [429, 503].includes(err.status);
+        const quick = err instanceof ApiError && [429, 502, 503, 504].includes(err.status);
         if (!quick) break;
         await sleep(800 * (attempt + 1));
       }
@@ -132,6 +133,7 @@ Rules:
 - Bill only for work that the input says was delivered or agreed. Never invent work or prices.
 - If the client matches someone in known_clients, reuse their email, business name and past rates when the input says "same as last time" or omits a rate.
 - Hourly work: unit HOURS, quantity = hours. Fixed deliverables: unit AMOUNT, quantity 1. Countable items: QUANTITY.
+- Currency: PayPal only invoices in ${PAYPAL_CURRENCIES.join(", ")}. If the input uses another currency (e.g. rupees/INR), keep the amounts exactly as stated, set currency to that code anyway, and add a missing_info item asking the freelancer to choose a PayPal currency and confirm the converted amounts. Never convert amounts yourself.
 - Due date: use what the input says ("net 15", "by Friday") relative to context.today; default to 14 days after today.
 - If something essential is missing (client email, a price), still fill your best guess or null, and add a clear question to missing_info.
 - note_to_client: friendly, specific to the work, signed with nothing (PayPal adds the sender).`;

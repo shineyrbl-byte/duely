@@ -1,4 +1,5 @@
 import { DraftSchema } from "@/lib/ai";
+import { isPayPalCurrency } from "@/lib/currencies";
 import { handle } from "@/lib/http";
 import { createAndSendInvoice, draftTotals, toRow } from "@/lib/paypal";
 import { logActivity, store } from "@/lib/store";
@@ -9,6 +10,8 @@ export async function POST(req: Request) {
     const draft = DraftSchema.parse(await req.json());
     if (!draft.client_email) throw new Error("Add the client's email before sending.");
     if (draft.items.length === 0) throw new Error("Add at least one line item.");
+    if (!isPayPalCurrency(draft.currency))
+      throw new Error(`PayPal can't invoice in ${draft.currency}. Pick a supported currency such as USD, EUR or GBP.`);
 
     const inv = await createAndSendInvoice(draft);
     const row = toRow(inv);
