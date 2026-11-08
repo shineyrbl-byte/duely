@@ -93,7 +93,7 @@ async function pp<T>(method: string, path: string, body?: unknown): Promise<T> {
   if (!res.ok) {
     const issue = json?.details?.[0];
     const msg = issue
-      ? `${issue.issue}: ${issue.description ?? ""} ${issue.field ? `(${issue.field})` : ""}`.trim()
+      ? [issue.issue, issue.description, issue.field ? `(${issue.field})` : ""].filter(Boolean).join(" ")
       : json?.message ?? `PayPal ${method} ${path} failed`;
     throw new PayPalError(msg, res.status, json);
   }
@@ -157,7 +157,7 @@ function buildInvoiceBody(d: InvoiceDraft, invoiceNumber: string, invoiceDate: s
       },
     ],
     items: toPayPalItems(d.items, d.currency, d.tax_percent),
-    configuration: { tax_calculated_after_discount: true, tax_inclusive: false, allow_tip: true },
+    configuration: { tax_calculated_after_discount: true, tax_inclusive: false },
     ...(d.discount_percent
       ? { amount: { breakdown: { discount: { invoice_discount: { percent: String(d.discount_percent) } } } } }
       : {}),
@@ -324,6 +324,13 @@ export async function verifyWebhook(headers: Headers, event: unknown): Promise<b
 const OPEN: InvoiceStatus[] = ["SENT", "UNPAID", "PARTIALLY_PAID", "SCHEDULED", "PAYMENT_PENDING"];
 const PAID: InvoiceStatus[] = ["PAID", "MARKED_AS_PAID", "REFUNDED", "PARTIALLY_REFUNDED", "MARKED_AS_REFUNDED"];
 
+/** The list endpoint omits the payer link; it follows a fixed pattern from the invoice id. */
+function payerViewUrl(inv: PPInvoice): string | null {
+  if (isMock || inv.status === "DRAFT" || !inv.id.startsWith("INV2-")) return null;
+  const host = process.env.PAYPAL_ENV === "live" ? "www.paypal.com" : "www.sandbox.paypal.com";
+  return `https://${host}/invoice/p/#${inv.id.slice(5).replaceAll("-", "")}`;
+}
+
 export function toRow(inv: PPInvoice): InvoiceRow {
   const bi = inv.primary_recipients?.[0]?.billing_info;
   const name =
@@ -361,7 +368,7 @@ export function toRow(inv: PPInvoice): InvoiceRow {
     invoiceDate: inv.detail.invoice_date ?? "",
     dueDate,
     daysOverdue,
-    payerUrl: inv.detail.metadata?.recipient_view_url ?? null,
+    payerUrl: inv.detail.metadata?.recipient_view_url ?? payerViewUrl(inv),
     remindersSent: reminders.length,
     lastReminderAt: reminders[reminders.length - 1] ?? null,
   };
