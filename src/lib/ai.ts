@@ -9,7 +9,7 @@
 
 import Anthropic from "@anthropic-ai/sdk";
 import { betaZodOutputFormat, betaZodTool } from "@anthropic-ai/sdk/helpers/beta/zod";
-import { GoogleGenAI, type Content, type Part } from "@google/genai";
+import { ApiError, GoogleGenAI, type Content, type GenerateContentParameters, type Part } from "@google/genai";
 import { z } from "zod";
 import { listRows } from "./paypal";
 import { isoDate, logActivity, newId, store, today } from "./store";
@@ -41,7 +41,9 @@ function requireProvider(): AiProvider {
 }
 
 const CLAUDE_MODEL = "claude-opus-5-5";
-const GEMINI_MODEL = process.env.GEMINI_MODEL ?? "gemini-3.8-flash";
+const GEMINI_MODEL = process.env.GEMINI_MODEL ?? "gemini-3.5-flash";
+// Free-tier models get overloaded at times; fall back through these in order.
+const GEMINI_FALLBACKS = [GEMINI_MODEL, "gemini-3.8-flash", "gemini-flash-latest"].filter((m, i, a) => a.indexOf(m) === i);
 
 // If a Claude request is declined by a safety classifier, the API retries it on a fallback model.
 const CLAUDE_FALLBACK: { betas: Anthropic.Beta.AnthropicBeta[]; fallbacks: "default" } = {
@@ -53,7 +55,43 @@ let anthropic: Anthropic | null = null;
 const claude = () => (anthropic ??= new Anthropic());
 
 let gemini: GoogleGenAI | null = null;
-const google = () => (gemini ??= new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY }));
+// 45s per call, so an overloaded model fails over instead of hanging the request.
+const google = () => (gemini ??= new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY, httpOptions: { timeout: 45_000 } }));
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const isTransient = (err: unknown) =>
+  (err instanceof ApiError && [404, 429, 500, 503].includes(err.status)) ||
+  (err instanceof Error && /abort|timeout|timed out|fetch failed/i.test(err.message));
+
+/**
+ * Calls Gemini, retrying briefly and then moving to the next fallback model when
+ * Google reports overload or rate limits. Pass `pinned` to stay on one model
+ * (needed mid-agent-loop, where thought signatures are tied to the model).
+ */
+async function geminiGenerate(params: Omit<GenerateContentParameters, "model">, pinned?: string) {
+  const models = pinned ? [pinned] : GEMINI_FALLBACKS;
+  let lastErr: unknown;
+  for (const model of models) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        return { model, res: await google().models.generateContent({ ...params, model }) };
+      } catch (err) {
+        if (!isTransient(err)) throw err;
+        lastErr = err;
+        // Only quick failures (busy / rate limited) are worth retrying on the same model.
+        const quick = err instanceof ApiError && [429, 503].includes(err.status);
+        if (!quick) break;
+        await sleep(800 * (attempt + 1));
+      }
+    }
+  }
+  const status = lastErr instanceof ApiError ? lastErr.status : 0;
+  throw new Error(
+    status === 429
+      ? "Gemini free-tier limit reached. Wait a minute and try again."
+      : "Gemini is busy right now. Please try again in a moment.",
+  );
+}
 
 /** Zod -> plain JSON Schema for Gemini (drop the $schema marker it doesn't need). */
 function jsonSchema(schema: z.ZodType) {
@@ -136,8 +174,7 @@ async function draftWithGemini(prompt: string, file?: DraftInput["file"]): Promi
   if (file) parts.push({ inlineData: { mimeType: file.mediaType, data: file.base64 } });
   parts.push({ text: prompt });
 
-  const res = await google().models.generateContent({
-    model: GEMINI_MODEL,
+  const { res } = await geminiGenerate({
     contents: [{ role: "user", parts }],
     config: {
       systemInstruction: DRAFT_SYSTEM,
@@ -198,7 +235,7 @@ Policy:
 - Notes: under 90 words, plain text, mention the invoice number and amount, and say the PayPal payment link is in the email. Sign off with the freelancer's first name.
 - Subject: under 80 characters.
 
-The freelancer approves every reminder before it is sent, so explain your reasoning briefly. End with a 2–3 sentence summary of today's collections picture.`;
+The freelancer approves every reminder before it is sent, so keep each tool call's reasoning brief. Your final reply is shown in a small panel: write only a 2–3 sentence plain-text summary of today's collections picture (no markdown, headings, bullets or per-invoice lists — the proposals are shown separately).`;
 
 /** A provider-neutral tool: one definition, wrapped for Claude or Gemini. */
 interface AgentTool<S extends z.ZodType = z.ZodType> {
@@ -318,8 +355,11 @@ async function agentWithGemini(tools: AgentTool[]): Promise<string> {
     ],
   };
 
+  let model: string | undefined;
   for (let turn = 0; turn < 20; turn++) {
-    const res = await google().models.generateContent({ model: GEMINI_MODEL, contents, config });
+    const out = await geminiGenerate({ contents, config }, model);
+    model = out.model;
+    const res = out.res;
     const calls = res.functionCalls ?? [];
     const modelTurn = res.candidates?.[0]?.content;
     if (calls.length === 0) return res.text?.trim() ?? "";
