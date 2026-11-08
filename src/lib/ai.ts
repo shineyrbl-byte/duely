@@ -1,28 +1,65 @@
-// Claude-powered features:
-//  1. draftInvoice  – turn a messy chat / voice note / screenshot / PDF into a structured invoice draft.
+// AI features, with two interchangeable providers:
+//   - Google Gemini (free tier) when GEMINI_API_KEY is set
+//   - Anthropic Claude when ANTHROPIC_API_KEY is set
+// Set AI_PROVIDER=gemini|anthropic to force one.
+//
+//  1. draftInvoice – turn a messy chat / voice note / screenshot / PDF into a structured invoice draft.
 //  2. runCollectionsAgent – an agent that reviews open PayPal invoices and *proposes* reminders.
 //     Nothing is sent to a client until the freelancer approves it in the UI.
 
 import Anthropic from "@anthropic-ai/sdk";
 import { betaZodOutputFormat, betaZodTool } from "@anthropic-ai/sdk/helpers/beta/zod";
+import { GoogleGenAI, type Content, type Part } from "@google/genai";
 import { z } from "zod";
 import { listRows } from "./paypal";
 import { isoDate, logActivity, newId, store, today } from "./store";
 import type { InvoiceDraft, InvoiceRow, ReminderProposal } from "./types";
 
-const MODEL = "claude-opus-5-5";
-// If a request is declined by a safety classifier, the API retries it on a fallback model.
-const FALLBACK: { betas: Anthropic.Beta.AnthropicBeta[]; fallbacks: "default" } = {
+// ---------- Provider selection ----------
+
+export type AiProvider = "gemini" | "anthropic";
+
+export function aiProvider(): AiProvider | null {
+  const forced = process.env.AI_PROVIDER?.toLowerCase();
+  if (forced === "gemini" || forced === "anthropic") return forced;
+  if (process.env.GEMINI_API_KEY) return "gemini";
+  if (process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN) return "anthropic";
+  return null;
+}
+
+export function aiLabel(): string | null {
+  const p = aiProvider();
+  if (p === "gemini") return `Gemini (${GEMINI_MODEL})`;
+  if (p === "anthropic") return `Claude (${CLAUDE_MODEL})`;
+  return null;
+}
+
+function requireProvider(): AiProvider {
+  const p = aiProvider();
+  if (!p) throw new Error("No AI key set — add GEMINI_API_KEY (free) or ANTHROPIC_API_KEY to .env.local.");
+  return p;
+}
+
+const CLAUDE_MODEL = "claude-opus-5-5";
+const GEMINI_MODEL = process.env.GEMINI_MODEL ?? "gemini-3.8-flash";
+
+// If a Claude request is declined by a safety classifier, the API retries it on a fallback model.
+const CLAUDE_FALLBACK: { betas: Anthropic.Beta.AnthropicBeta[]; fallbacks: "default" } = {
   betas: ["server-side-fallback-2026-07-01"],
   fallbacks: "default",
 };
 
-let client: Anthropic | null = null;
-function claude() {
-  if (!process.env.ANTHROPIC_API_KEY && !process.env.ANTHROPIC_AUTH_TOKEN) {
-    throw new Error("ANTHROPIC_API_KEY is not set — add it to .env.local to use the AI features.");
-  }
-  return (client ??= new Anthropic());
+let anthropic: Anthropic | null = null;
+const claude = () => (anthropic ??= new Anthropic());
+
+let gemini: GoogleGenAI | null = null;
+const google = () => (gemini ??= new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY }));
+
+/** Zod -> plain JSON Schema for Gemini (drop the $schema marker it doesn't need). */
+function jsonSchema(schema: z.ZodType) {
+  const out = z.toJSONSchema(schema) as Record<string, unknown>;
+  delete out.$schema;
+  return out;
 }
 
 // ---------- 1. Invoice drafting ----------
@@ -51,6 +88,16 @@ export const DraftSchema = z.object({
   reasoning_summary: z.string().describe("One or two sentences on how you read the input."),
 });
 
+const DRAFT_SYSTEM = `You turn a freelancer's messy notes, client chats, voice transcripts, screenshots or contracts into a PayPal invoice draft.
+
+Rules:
+- Bill only for work that the input says was delivered or agreed. Never invent work or prices.
+- If the client matches someone in known_clients, reuse their email, business name and past rates when the input says "same as last time" or omits a rate.
+- Hourly work: unit HOURS, quantity = hours. Fixed deliverables: unit AMOUNT, quantity 1. Countable items: QUANTITY.
+- Due date: use what the input says ("net 15", "by Friday") relative to context.today; default to 14 days after today.
+- If something essential is missing (client email, a price), still fill your best guess or null, and add a clear question to missing_info.
+- note_to_client: friendly, specific to the work, signed with nothing (PayPal adds the sender).`;
+
 export interface DraftInput {
   text: string;
   file?: { mediaType: string; base64: string };
@@ -72,6 +119,7 @@ function clientMemory(rows: InvoiceRow[]) {
 }
 
 export async function draftInvoice(input: DraftInput): Promise<InvoiceDraft> {
+  const provider = requireProvider();
   const rows = await listRows().catch(() => [] as InvoiceRow[]);
   const context = {
     today: isoDate(today()),
@@ -79,45 +127,55 @@ export async function draftInvoice(input: DraftInput): Promise<InvoiceDraft> {
     freelancer: process.env.INVOICER_NAME ?? "Alex Rivera",
     known_clients: clientMemory(rows),
   };
+  const prompt = `<context>\n${JSON.stringify(context, null, 2)}\n</context>\n\n<freelancer_input>\n${input.text || "(see attachment)"}\n</freelancer_input>`;
+  return provider === "gemini" ? draftWithGemini(prompt, input.file) : draftWithClaude(prompt, input.file);
+}
 
-  const content: Anthropic.Beta.BetaContentBlockParam[] = [];
-  if (input.file) {
-    if (input.file.mediaType === "application/pdf") {
-      content.push({ type: "document", source: { type: "base64", media_type: "application/pdf", data: input.file.base64 } });
-    } else {
-      content.push({
-        type: "image",
-        source: {
-          type: "base64",
-          media_type: input.file.mediaType as "image/png" | "image/jpeg" | "image/webp" | "image/gif",
-          data: input.file.base64,
-        },
-      });
-    }
-  }
-  content.push({
-    type: "text",
-    text: `<context>\n${JSON.stringify(context, null, 2)}\n</context>\n\n<freelancer_input>\n${input.text || "(see attachment)"}\n</freelancer_input>`,
+async function draftWithGemini(prompt: string, file?: DraftInput["file"]): Promise<InvoiceDraft> {
+  const parts: Part[] = [];
+  if (file) parts.push({ inlineData: { mimeType: file.mediaType, data: file.base64 } });
+  parts.push({ text: prompt });
+
+  const res = await google().models.generateContent({
+    model: GEMINI_MODEL,
+    contents: [{ role: "user", parts }],
+    config: {
+      systemInstruction: DRAFT_SYSTEM,
+      responseMimeType: "application/json",
+      responseJsonSchema: jsonSchema(DraftSchema),
+    },
   });
+  if (!res.text) throw new Error("The AI returned no draft. Try rephrasing the input.");
+  const parsed = DraftSchema.safeParse(JSON.parse(res.text));
+  if (!parsed.success) throw new Error("The AI response could not be parsed. Try rephrasing the input.");
+  return parsed.data;
+}
+
+async function draftWithClaude(prompt: string, file?: DraftInput["file"]): Promise<InvoiceDraft> {
+  const content: Anthropic.Beta.BetaContentBlockParam[] = [];
+  if (file?.mediaType === "application/pdf") {
+    content.push({ type: "document", source: { type: "base64", media_type: "application/pdf", data: file.base64 } });
+  } else if (file) {
+    content.push({
+      type: "image",
+      source: {
+        type: "base64",
+        media_type: file.mediaType as "image/png" | "image/jpeg" | "image/webp" | "image/gif",
+        data: file.base64,
+      },
+    });
+  }
+  content.push({ type: "text", text: prompt });
 
   const res = await claude().beta.messages.parse({
-    model: MODEL,
+    model: CLAUDE_MODEL,
     max_tokens: 16000,
-    ...FALLBACK,
+    ...CLAUDE_FALLBACK,
     thinking: { type: "adaptive" },
     output_config: { effort: "medium", format: betaZodOutputFormat(DraftSchema) },
-    system: `You turn a freelancer's messy notes, client chats, voice transcripts, screenshots or contracts into a PayPal invoice draft.
-
-Rules:
-- Bill only for work that the input says was delivered or agreed. Never invent work or prices.
-- If the client matches someone in known_clients, reuse their email, business name and past rates when the input says "same as last time" or omits a rate.
-- Hourly work: unit HOURS, quantity = hours. Fixed deliverables: unit AMOUNT, quantity 1. Countable items: QUANTITY.
-- Due date: use what the input says ("net 15", "by Friday") relative to context.today; default to 14 days after today.
-- If something essential is missing (client email, a price), still fill your best guess or null, and add a clear question to missing_info.
-- note_to_client: friendly, specific to the work, signed with nothing (PayPal adds the sender).`,
+    system: DRAFT_SYSTEM,
     messages: [{ role: "user", content }],
   });
-
   if (res.stop_reason === "refusal") throw new Error("The AI declined to process this input.");
   if (!res.parsed_output) throw new Error("The AI response could not be parsed. Try rephrasing the input.");
   return res.parsed_output;
@@ -142,120 +200,180 @@ Policy:
 
 The freelancer approves every reminder before it is sent, so explain your reasoning briefly. End with a 2–3 sentence summary of today's collections picture.`;
 
-export async function runCollectionsAgent(): Promise<{ summary: string; proposals: ReminderProposal[] }> {
-  const rows = await listRows();
-  const open = rows.filter((r) => ["Overdue", "Due soon", "Open"].includes(r.health));
-  const runProposals: ReminderProposal[] = [];
+/** A provider-neutral tool: one definition, wrapped for Claude or Gemini. */
+interface AgentTool<S extends z.ZodType = z.ZodType> {
+  name: string;
+  description: string;
+  schema: S;
+  run: (input: z.infer<S>) => Promise<string>;
+}
+const tool = <S extends z.ZodType>(t: AgentTool<S>) => t as unknown as AgentTool;
+
+function buildAgentTools(rows: InvoiceRow[], open: InvoiceRow[], runProposals: ReminderProposal[]): AgentTool[] {
   const freelancer = process.env.INVOICER_NAME ?? "Alex Rivera";
-
-  // Drop old pending proposals: this run replaces them.
-  store.proposals = store.proposals.filter((p) => p.status !== "pending");
-
-  const listReceivables = betaZodTool({
-    name: "list_receivables",
-    description: "List the freelancer's open (unpaid) PayPal invoices with amounts, due dates, days overdue and reminder history.",
-    inputSchema: z.object({}),
-    run: async () =>
-      JSON.stringify({
-        today: isoDate(today()),
-        freelancer,
-        invoices: open.map((r) => ({
-          invoice_id: r.id,
-          number: r.number,
-          client: r.clientName,
-          client_email: r.clientEmail,
-          amount_due: `${r.amountDue.toFixed(2)} ${r.currency}`,
-          invoice_date: r.invoiceDate,
-          due_date: r.dueDate,
-          days_overdue: r.daysOverdue,
-          reminders_sent: r.remindersSent,
-          last_reminder_at: r.lastReminderAt,
-        })),
-      }),
-  });
-
-  const clientHistory = betaZodTool({
-    name: "get_client_history",
-    description: "Payment track record for one client across all their PayPal invoices.",
-    inputSchema: z.object({ client_email: z.string() }),
-    run: async ({ client_email }) => {
-      const mine = rows.filter((r) => r.clientEmail.toLowerCase() === client_email.toLowerCase());
-      if (mine.length === 0) return "No invoices found for that email.";
-      return JSON.stringify({
-        total_invoices: mine.length,
-        paid: mine.filter((r) => r.health === "Paid").length,
-        overdue_now: mine.filter((r) => r.health === "Overdue").length,
-        cancelled: mine.filter((r) => r.health === "Cancelled").length,
-        lifetime_billed: mine.reduce((s, r) => s + r.total, 0).toFixed(2),
-        outstanding: mine.reduce((s, r) => s + r.amountDue, 0).toFixed(2),
-        reminders_sent_total: mine.reduce((s, r) => s + r.remindersSent, 0),
-      });
-    },
-  });
-
-  const proposeReminder = betaZodTool({
-    name: "propose_reminder",
-    description: "Queue a payment reminder for the freelancer to approve. It is NOT sent until they approve it.",
-    inputSchema: z.object({
-      invoice_id: z.string(),
-      urgency: z.enum(["heads-up", "gentle", "firm", "final"]),
-      subject: z.string(),
-      note: z.string(),
-      reasoning: z.string().describe("One sentence on why this reminder and this tone."),
+  return [
+    tool({
+      name: "list_receivables",
+      description:
+        "List the freelancer's open (unpaid) PayPal invoices with amounts, due dates, days overdue and reminder history.",
+      schema: z.object({}),
+      run: async () =>
+        JSON.stringify({
+          today: isoDate(today()),
+          freelancer,
+          invoices: open.map((r) => ({
+            invoice_id: r.id,
+            number: r.number,
+            client: r.clientName,
+            client_email: r.clientEmail,
+            amount_due: `${r.amountDue.toFixed(2)} ${r.currency}`,
+            invoice_date: r.invoiceDate,
+            due_date: r.dueDate,
+            days_overdue: r.daysOverdue,
+            reminders_sent: r.remindersSent,
+            last_reminder_at: r.lastReminderAt,
+          })),
+        }),
     }),
-    run: async (p) => {
-      const inv = open.find((r) => r.id === p.invoice_id);
-      if (!inv) return `Error: invoice ${p.invoice_id} is not an open invoice.`;
-      if (runProposals.some((x) => x.invoiceId === inv.id)) return "Already proposed a reminder for this invoice.";
-      const proposal: ReminderProposal = {
-        id: newId("rem"),
-        invoiceId: inv.id,
-        invoiceNumber: inv.number,
-        clientName: inv.clientName,
-        amountDue: inv.amountDue,
-        currency: inv.currency,
-        daysOverdue: inv.daysOverdue,
-        urgency: p.urgency,
-        subject: p.subject.slice(0, 200),
-        note: p.note,
-        reasoning: p.reasoning,
-        status: "pending",
-        createdAt: new Date().toISOString(),
-      };
-      runProposals.push(proposal);
-      return `Queued for approval (${proposal.id}).`;
-    },
-  });
+    tool({
+      name: "get_client_history",
+      description: "Payment track record for one client across all their PayPal invoices.",
+      schema: z.object({ client_email: z.string() }),
+      run: async ({ client_email }) => {
+        const mine = rows.filter((r) => r.clientEmail.toLowerCase() === client_email.toLowerCase());
+        if (mine.length === 0) return "No invoices found for that email.";
+        return JSON.stringify({
+          total_invoices: mine.length,
+          paid: mine.filter((r) => r.health === "Paid").length,
+          overdue_now: mine.filter((r) => r.health === "Overdue").length,
+          cancelled: mine.filter((r) => r.health === "Cancelled").length,
+          lifetime_billed: mine.reduce((s, r) => s + r.total, 0).toFixed(2),
+          outstanding: mine.reduce((s, r) => s + r.amountDue, 0).toFixed(2),
+          reminders_sent_total: mine.reduce((s, r) => s + r.remindersSent, 0),
+        });
+      },
+    }),
+    tool({
+      name: "propose_reminder",
+      description: "Queue a payment reminder for the freelancer to approve. It is NOT sent until they approve it.",
+      schema: z.object({
+        invoice_id: z.string(),
+        urgency: z.enum(["heads-up", "gentle", "firm", "final"]),
+        subject: z.string(),
+        note: z.string(),
+        reasoning: z.string().describe("One sentence on why this reminder and this tone."),
+      }),
+      run: async (p) => {
+        const inv = open.find((r) => r.id === p.invoice_id);
+        if (!inv) return `Error: invoice ${p.invoice_id} is not an open invoice.`;
+        if (runProposals.some((x) => x.invoiceId === inv.id)) return "Already proposed a reminder for this invoice.";
+        const proposal: ReminderProposal = {
+          id: newId("rem"),
+          invoiceId: inv.id,
+          invoiceNumber: inv.number,
+          clientName: inv.clientName,
+          amountDue: inv.amountDue,
+          currency: inv.currency,
+          daysOverdue: inv.daysOverdue,
+          urgency: p.urgency,
+          subject: p.subject.slice(0, 200),
+          note: p.note,
+          reasoning: p.reasoning,
+          status: "pending",
+          createdAt: new Date().toISOString(),
+        };
+        runProposals.push(proposal);
+        return `Queued for approval (${proposal.id}).`;
+      },
+    }),
+    tool({
+      name: "skip_invoice",
+      description: "Record that an open invoice needs no reminder today, and why.",
+      schema: z.object({ invoice_id: z.string(), reasoning: z.string() }),
+      run: async () => "Noted.",
+    }),
+  ];
+}
 
-  const skipInvoice = betaZodTool({
-    name: "skip_invoice",
-    description: "Record that an open invoice needs no reminder today, and why.",
-    inputSchema: z.object({ invoice_id: z.string(), reasoning: z.string() }),
-    run: async () => "Noted.",
-  });
+async function runTool(tools: AgentTool[], name: string, args: unknown): Promise<string> {
+  const t = tools.find((x) => x.name === name);
+  if (!t) return `Error: unknown tool ${name}.`;
+  const parsed = t.schema.safeParse(args ?? {});
+  if (!parsed.success) return `Error: invalid input for ${name}: ${parsed.error.message}`;
+  return t.run(parsed.data);
+}
 
+async function agentWithGemini(tools: AgentTool[]): Promise<string> {
+  const contents: Content[] = [{ role: "user", parts: [{ text: "Run today's collections review." }] }];
+  const config = {
+    systemInstruction: AGENT_SYSTEM,
+    tools: [
+      {
+        functionDeclarations: tools.map((t) => ({
+          name: t.name,
+          description: t.description,
+          parametersJsonSchema: jsonSchema(t.schema),
+        })),
+      },
+    ],
+  };
+
+  for (let turn = 0; turn < 20; turn++) {
+    const res = await google().models.generateContent({ model: GEMINI_MODEL, contents, config });
+    const calls = res.functionCalls ?? [];
+    const modelTurn = res.candidates?.[0]?.content;
+    if (calls.length === 0) return res.text?.trim() ?? "";
+
+    // Send the model's turn back unchanged: Gemini needs its thought signatures preserved.
+    if (modelTurn) contents.push(modelTurn);
+    const responses: Part[] = [];
+    for (const call of calls) {
+      const output = await runTool(tools, call.name ?? "", call.args);
+      responses.push({ functionResponse: { id: call.id, name: call.name, response: { output } } });
+    }
+    contents.push({ role: "user", parts: responses });
+  }
+  return "The agent stopped after reaching its step limit.";
+}
+
+async function agentWithClaude(tools: AgentTool[]): Promise<string> {
   const final = await claude().beta.messages.toolRunner({
-    model: MODEL,
+    model: CLAUDE_MODEL,
     max_tokens: 16000,
-    ...FALLBACK,
+    ...CLAUDE_FALLBACK,
     thinking: { type: "adaptive" },
     output_config: { effort: "medium" },
     system: AGENT_SYSTEM,
-    tools: [listReceivables, clientHistory, proposeReminder, skipInvoice],
+    tools: tools.map((t) =>
+      betaZodTool({ name: t.name, description: t.description, inputSchema: t.schema, run: (input) => t.run(input) }),
+    ),
     messages: [{ role: "user", content: "Run today's collections review." }],
     max_iterations: 20,
   });
+  if (final.stop_reason === "refusal") return "The agent declined this request.";
+  return final.content
+    .filter((b): b is Anthropic.Beta.BetaTextBlock => b.type === "text")
+    .map((b) => b.text)
+    .join("\n")
+    .trim();
+}
 
-  const summary =
-    final.stop_reason === "refusal"
-      ? "The agent declined this request."
-      : final.content
-          .filter((b): b is Anthropic.Beta.BetaTextBlock => b.type === "text")
-          .map((b) => b.text)
-          .join("\n")
-          .trim();
+export async function runCollectionsAgent(): Promise<{ summary: string; proposals: ReminderProposal[] }> {
+  const provider = requireProvider();
+  const rows = await listRows();
+  const open = rows.filter((r) => ["Overdue", "Due soon", "Open"].includes(r.health));
+  const runProposals: ReminderProposal[] = [];
+  const tools = buildAgentTools(rows, open, runProposals);
+
+  // This run replaces any proposals still waiting for approval.
+  store.proposals = store.proposals.filter((p) => p.status !== "pending");
+
+  const summary = provider === "gemini" ? await agentWithGemini(tools) : await agentWithClaude(tools);
 
   store.proposals.unshift(...runProposals);
-  logActivity("agent", `Collections agent reviewed ${open.length} open invoices and proposed ${runProposals.length} reminder(s).`);
+  logActivity(
+    "agent",
+    `Collections agent (${aiLabel()}) reviewed ${open.length} open invoices and proposed ${runProposals.length} reminder(s).`,
+  );
   return { summary, proposals: runProposals };
 }
