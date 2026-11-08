@@ -1,4 +1,5 @@
 import { connection } from "next/server";
+import { aiLabel } from "@/lib/ai";
 import { handle } from "@/lib/http";
 import { isMock, listRows } from "@/lib/paypal";
 import { isoDate, store, today } from "@/lib/store";
@@ -13,7 +14,8 @@ export async function GET() {
     today: isoDate(today()),
     clockOffsetDays: store.clockOffsetDays,
     mock: isMock,
-    aiEnabled: Boolean(process.env.ANTHROPIC_API_KEY || process.env.ANTHROPIC_AUTH_TOKEN),
+    aiEnabled: aiLabel() !== null,
+    aiLabel: aiLabel(),
     freelancer: process.env.INVOICER_NAME ?? "Alex Rivera",
   }));
 }

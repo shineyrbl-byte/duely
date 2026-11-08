@@ -149,7 +149,7 @@ export default function Composer({ aiEnabled, onSent }: { aiEnabled: boolean; on
               )}
             </button>
           </div>
-          {!aiEnabled && <p className="text-xs text-amber-700">Set ANTHROPIC_API_KEY to turn on AI drafting.</p>}
+          {!aiEnabled && <p className="text-xs text-amber-700">Add GEMINI_API_KEY (free) or ANTHROPIC_API_KEY to .env.local to turn on AI drafting.</p>}
         </div>
       )}
 

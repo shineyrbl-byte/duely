@@ -21,6 +21,7 @@ interface State {
   clockOffsetDays: number;
   mock: boolean;
   aiEnabled: boolean;
+  aiLabel: string | null;
   freelancer: string;
 }
 
@@ -111,6 +112,11 @@ export default function Dashboard() {
         {state && (
           <span className={`rounded-full px-2.5 py-1 text-xs font-medium ${state.mock ? "bg-amber-100 text-amber-800" : "bg-emerald-100 text-emerald-800"}`}>
             {state.mock ? "Demo mode · mock PayPal" : "Connected · PayPal sandbox"}
+          </span>
+        )}
+        {state && (
+          <span className={`rounded-full px-2.5 py-1 text-xs font-medium ${state.aiLabel ? "bg-brand-soft text-indigo-800" : "bg-gray-100 text-gray-500"}`}>
+            {state.aiLabel ? `AI · ${state.aiLabel}` : "AI off"}
           </span>
         )}
         <div className="flex-1" />
