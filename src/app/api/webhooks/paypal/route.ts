@@ -1,5 +1,5 @@
 import { verifyWebhook } from "@/lib/paypal";
-import { logActivity } from "@/lib/store";
+import { loadStore, logActivity, saveStore } from "@/lib/store";
 
 // PayPal webhook receiver. Subscribe your sandbox app to INVOICING.INVOICE.* events
 // and set PAYPAL_WEBHOOK_ID. Events are verified with PayPal before we trust them.
@@ -22,9 +22,11 @@ export async function POST(req: Request) {
     "INVOICING.INVOICE.CANCELLED": `Invoice #${number} was cancelled.`,
     "INVOICING.INVOICE.REFUNDED": `Invoice #${number} was refunded.`,
   };
+  await loadStore();
   logActivity(
     event.event_type === "INVOICING.INVOICE.PAID" ? "payment" : "webhook",
     labels[event.event_type ?? ""] ?? `PayPal event ${event.event_type} for invoice #${number}.`,
   );
+  await saveStore();
   return Response.json({ ok: true });
 }
