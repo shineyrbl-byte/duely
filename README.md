@@ -4,7 +4,8 @@
 
 Built for the PayPal AI Hackathon (Nov 2026).
 
-**Live demo:** https://duely-ten-iota.vercel.app (PayPal sandbox + Gemini)
+**Live demo:** https://duely-ten-iota.vercel.app (PayPal sandbox + Gemini)  
+**Demo video:** https://youtu.be/fmJgOGCpJZk
 
 ## The problem
 
