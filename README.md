@@ -4,6 +4,8 @@
 
 Built for the PayPal AI Hackathon (Nov 2026).
 
+**Live demo:** https://duely-ten-iota.vercel.app (PayPal sandbox + Gemini)
+
 ## The problem
 
 Freelancers lose hours every month on admin: turning a WhatsApp thread or a voice memo into an invoice, remembering who has paid, and writing awkward "just following up…" emails. Late payment is common, and the chasing is the part people hate most.
@@ -40,8 +42,10 @@ Click **Load demo invoices**, then move the **Demo clock** forward to see invoic
 4. Send an invoice, click **Pay link ↗**, and pay it with a sandbox *personal* account. The dashboard updates on its next poll.
 5. Optional: deploy (see below), subscribe a webhook to `INVOICING.INVOICE.*` at `https://<your-app>/api/webhooks/paypal`, and set `PAYPAL_WEBHOOK_ID`.
 
-### Deploy on Render
-The repo includes `render.yaml`. Create a new **Blueprint** on Render, point it at this repo, and fill in the environment variables.
+### Deploy
+- **Vercel (used for the live demo):** import the repo, add the environment variables, and connect a free **Upstash for Redis** database from the Vercel Marketplace. Duely loads its state (agent proposals, reminder history, activity, demo clock) from Redis before each request and saves it after, so serverless instances share it.
+- **Any Docker host:** the included `Dockerfile` serves the app on port 7860.
+- **Render:** `render.yaml` defines a free web service.
 
 ## How it's built
 
@@ -51,13 +55,13 @@ The repo includes `render.yaml`. Create a new **Blueprint** on Render, point it 
 | Payments | PayPal REST: OAuth2 client credentials, **Invoicing v2** (`generate-next-invoice-number`, create, send, remind, record payment, cancel, list), **Webhooks** (signature verification) |
 | AI | **Google Gemini** (`@google/genai`, free tier) or **Claude Opus 5.5** (`@anthropic-ai/sdk`) — same prompts, schema and tools for both |
 | Grid | **AG Grid** Community (Quartz theme, custom cell renderers, quick filter) |
-| Hosting | **Render** (`render.yaml`) |
+| Hosting | **Vercel** + **Upstash Redis** for shared state (Dockerfile and `render.yaml` also included) |
 
 ```
 src/
   lib/paypal.ts        PayPal client (sandbox + mock), invoice normalisation
   lib/ai.ts            AI (Gemini or Claude): invoice drafting + collections agent
-  lib/store.ts         proposals, reminder history, activity feed, demo clock
+  lib/store.ts         proposals, reminder history, activity feed, demo clock (+ Redis sync)
   app/api/...          route handlers (state, invoices, ai/draft, agent, webhooks, demo)
   components/...       Composer, InvoiceGrid (AG Grid), AgentPanel, Dashboard
 ```
@@ -81,7 +85,7 @@ Duely works with either provider; it picks Gemini when `GEMINI_API_KEY` is set, 
 
 ## Limitations
 
-- Agent proposals, reminder history and the activity feed live in server memory, so they reset on restart. PayPal stays the source of truth for invoices.
+- Without Redis configured, agent proposals, reminder history and the activity feed live in server memory and reset on restart. PayPal stays the source of truth for invoices.
 - The demo clock shifts "today" only inside Duely, so overdue flows can be shown without waiting weeks.
 
 ## License
